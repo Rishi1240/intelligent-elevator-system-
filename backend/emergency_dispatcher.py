@@ -130,7 +130,10 @@ class EmergencyDispatcher:
             heading_down = (target is not None and target < pos) or (stops and stops[0] < pos)
 
             can_safely_insert = False
+            cost = float("inf")
+            rationale = ""
             if heading_up and pos < floor:
+
                 furthest = max(stops or [target or pos])
                 # Only if floor is on the way or extends the current upward run
                 if floor <= furthest or occ == 0:

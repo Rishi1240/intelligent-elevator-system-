@@ -11,11 +11,15 @@ Validates:
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "backend"))
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from elevator_env import ElevatorEnvironment
-from q_learning_agent import QLearningAgent
-import app as flask_app
+from backend.elevator_env import ElevatorEnvironment
+from backend.q_learning_agent import QLearningAgent
+import backend.app as flask_app
+
+
 
 
 def test_1_idle_elevators_stay_stationary():
@@ -165,7 +169,9 @@ def test_3_concurrent_requests_no_conflict():
     assert 0 not in eligible_elevators or len(eligible_elevators) > 1, "Idle elevators 1 or 2 should be preferred"
 
     dispatch_action = q_agent.get_dispatch_action(env.get_state(), valid_actions, heuristics)
+    assert dispatch_action is not None, "Dispatcher should return a valid action"
     chosen_elev = dispatch_action[0]
+
     env.assign_request(req_b, chosen_elev)
 
     assert chosen_elev in [1, 2], f"Dispatcher should assign idle Elevator 1 or 2, got {chosen_elev}"

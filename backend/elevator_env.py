@@ -10,6 +10,8 @@ Caps:
 """
 
 import time
+from typing import Any
+
 
 # ── absolute limits ──────────────────────────────────────────────────────────
 MAX_FLOORS     = 20
@@ -42,7 +44,9 @@ class ElevatorEnvironment:
             for f in range(1, self.num_floors + 1)
         ]
 
+        self.emergency_dispatcher: Any = None
         self.reset()
+
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -79,7 +83,8 @@ class ElevatorEnvironment:
         self.elevator_passengers = [[] for _ in range(self.num_elevators)]
         # committed_targets[e] = destination floor the elevator must reach.
         # Once passengers board, this destination cannot be overridden by new Q-actions.
-        self.committed_targets   = [None] * self.num_elevators
+        self.committed_targets: list[int | None] = [None] * self.num_elevators
+
         self.assigned_stops      = [[] for _ in range(self.num_elevators)]
         self.pending_requests    = []
         self.congestion_prediction = 0.20

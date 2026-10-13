@@ -70,7 +70,7 @@ class DataProcessor:
 
         for i in range(num_samples):
             X_seq[i] = X[i : i + seq_len]
-            if y is not None:
+            if y is not None and y_seq is not None:
                 # Target is congestion_level at the end of the sequence window
                 y_seq[i] = y[i + seq_len - 1]
 
@@ -97,12 +97,13 @@ class DataProcessor:
         if seq_arr.ndim == 3:
             orig_shape = seq_arr.shape
             reshaped = seq_arr.reshape(-1, orig_shape[-1])
-            scaled = self.scaler.transform(reshaped)
+            scaled = np.asarray(self.scaler.transform(reshaped))
             return scaled.reshape(orig_shape)
         elif seq_arr.ndim == 2:
             return self.scaler.transform(seq_arr)
         else:
             raise ValueError(f"Expected sequence of 2D or 3D, got ndim={seq_arr.ndim}")
+
 
     def save_scaler(self, path):
         """Saves fitted StandardScaler to disk using joblib."""

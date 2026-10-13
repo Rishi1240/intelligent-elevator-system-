@@ -15,14 +15,15 @@ import sys
 import os
 import time
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-BACKEND_DIR = os.path.join(CURRENT_DIR, "backend")
-if BACKEND_DIR not in sys.path:
-    sys.path.insert(0, BACKEND_DIR)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-import app as flask_app
-from elevator_env import ElevatorEnvironment
-from emergency_dispatcher import EmergencyDispatcher
+import backend.app as flask_app
+from backend.elevator_env import ElevatorEnvironment
+from backend.emergency_dispatcher import EmergencyDispatcher
+
+
 
 
 def run_all_tests():

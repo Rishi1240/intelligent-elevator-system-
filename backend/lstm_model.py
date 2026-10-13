@@ -14,7 +14,17 @@ try:
     from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
     TF_AVAILABLE = True
 except ImportError:
+    tf = None
+    Sequential = None
+    keras_load_model = None
+    LSTM = None
+    Dense = None
+    Dropout = None
+    Input = None
+    EarlyStopping = None
+    ModelCheckpoint = None
     TF_AVAILABLE = False
+
 
 
 class LSTMModel:
@@ -26,7 +36,7 @@ class LSTMModel:
 
     def build_model(self):
         """Builds and compiles the Keras Sequential LSTM model."""
-        if not TF_AVAILABLE:
+        if not TF_AVAILABLE or Sequential is None or Input is None or LSTM is None or Dropout is None or Dense is None:
             raise ImportError("TensorFlow/Keras is required to build and train the LSTM model.")
 
         model = Sequential([
@@ -54,11 +64,14 @@ class LSTMModel:
                 self.input_features = X_train.shape[2]
             self.build_model()
 
-        callbacks = [
-            EarlyStopping(monitor="val_loss" if validation_data is not None else "loss", patience=5, restore_best_weights=True)
-        ]
+        callbacks: list = []
+        if EarlyStopping is not None:
+            callbacks.append(
+                EarlyStopping(monitor="val_loss" if validation_data is not None else "loss", patience=5, restore_best_weights=True)
+            )
 
-        if checkpoint_path:
+
+        if checkpoint_path and ModelCheckpoint is not None:
             os.makedirs(os.path.dirname(checkpoint_path) if os.path.dirname(checkpoint_path) else ".", exist_ok=True)
             checkpoint = ModelCheckpoint(
                 filepath=checkpoint_path,
@@ -68,7 +81,11 @@ class LSTMModel:
             )
             callbacks.append(checkpoint)
 
+        if self.model is None:
+            raise RuntimeError("Model is not initialized.")
+
         history = self.model.fit(
+
             X_train, y_train,
             epochs=epochs,
             batch_size=batch_size,
@@ -133,9 +150,12 @@ class LSTMModel:
             raise FileNotFoundError(f"Model file not found at {path}")
 
         try:
-            self.model = keras_load_model(path)
+            if keras_load_model is not None:
+                self.model = keras_load_model(path)
         except Exception:
             # Try building architecture then loading weights
             self.build_model()
-            self.model.load_weights(path)
+            if self.model is not None:
+                self.model.load_weights(path)
         return True
+

@@ -12,15 +12,19 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-if CURRENT_DIR not in sys.path:
-    sys.path.append(CURRENT_DIR)
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+for p in (CURRENT_DIR, PROJECT_ROOT):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-from lstm_model import LSTMModel
-from data_processor import DataProcessor
-from q_learning_agent import QLearningAgent
-from elevator_env import ElevatorEnvironment
-from batch_dispatcher import RequestBatchDispatcher
-from emergency_dispatcher import EmergencyDispatcher
+from backend.lstm_model import LSTMModel
+from backend.data_processor import DataProcessor
+from backend.q_learning_agent import QLearningAgent
+from backend.elevator_env import ElevatorEnvironment
+from backend.batch_dispatcher import RequestBatchDispatcher
+from backend.emergency_dispatcher import EmergencyDispatcher
+
+
 
 app = Flask(__name__)
 # Enable CORS for React frontend (Vite port 5173 and CRA port 3000)

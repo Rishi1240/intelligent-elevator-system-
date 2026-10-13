@@ -1,0 +1,21 @@
+{
+  "include": [
+    "backend",
+    "test_batch_dispatch.py",
+    "test_direction_reversal.py",
+    "test_dispatch_logic.py",
+    "test_emergency_dispatch.py",
+    "test_route_batching.py"
+  ],
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    ".venv"
+  ],
+  "extraPaths": [
+    ".",
+    "backend"
+  ],
+  "venvPath": ".",
+  "venv": ".venv"
+}

@@ -22,12 +22,16 @@ import os
 import time
 import threading
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "backend"))
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from elevator_env import ElevatorEnvironment
-from q_learning_agent import QLearningAgent
-from batch_dispatcher import RequestBatchDispatcher, BATCH_WINDOW_SECONDS
-import app as flask_app
+from backend.elevator_env import ElevatorEnvironment
+from backend.q_learning_agent import QLearningAgent
+from backend.batch_dispatcher import RequestBatchDispatcher, BATCH_WINDOW_SECONDS
+import backend.app as flask_app
+
+
 
 PASS = "\033[92m[PASS]\033[0m"
 FAIL = "\033[91m[FAIL]\033[0m"

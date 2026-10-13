@@ -15,10 +15,14 @@ Tests:
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "backend"))
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from elevator_env import ElevatorEnvironment
-from q_learning_agent import QLearningAgent
+from backend.elevator_env import ElevatorEnvironment
+from backend.q_learning_agent import QLearningAgent
+
+
 
 def test_direction_reversal_lifecycle():
     print("==================================================================")
