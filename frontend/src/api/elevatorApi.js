@@ -3,7 +3,7 @@
  * Configured for http://localhost:5000 with resilient error handling.
  */
 
-const API_BASE_URL = 'http://localhost:5001/api';
+const API_BASE_URL = 'http://localhost:5000/api';
 
 export const elevatorApi = {
   async getState() {
@@ -78,6 +78,35 @@ export const elevatorApi = {
       body: JSON.stringify({ num_floors: numFloors, num_elevators: numElevators, capacity }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to configure system`);
+    return await res.json();
+  },
+
+  async dispatchEmergency(floor) {
+    const res = await fetch(`${API_BASE_URL}/emergency`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ floor }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to dispatch emergency`);
+    return await res.json();
+  },
+
+  async resolveEmergency(emergencyId, floor) {
+    const res = await fetch(`${API_BASE_URL}/emergency/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ emergency_id: emergencyId, floor }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to resolve emergency`);
+    return await res.json();
+  },
+
+  async getEmergencyStatus() {
+    const res = await fetch(`${API_BASE_URL}/emergency/status`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to get emergency status`);
     return await res.json();
   },
 };

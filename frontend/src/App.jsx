@@ -31,6 +31,13 @@ export default function App() {
   const [numFloors,         setNumFloors]         = useState(10);
   const [numElevators,      setNumElevators]      = useState(3);
   const [capacity,          setCapacity]          = useState(8);
+  // ── batch window state ──────────────────────────────────────────
+  const [batchActive,       setBatchActive]       = useState(false);
+  const [batchCountdownMs,  setBatchCountdownMs]  = useState(0);
+  const [batchQueued,       setBatchQueued]       = useState(0);
+  // ── emergency state ──────────────────────────────────────────────
+  const [activeEmergencies, setActiveEmergencies] = useState([]);
+  const [currentEmergency,  setCurrentEmergency]  = useState(null);
 
   // ── UI state ──────────────────────────────────────────────────────────────
   const [logs,             setLogs]             = useState([]);
@@ -69,15 +76,22 @@ export default function App() {
     if (typeof data.num_floors === 'number')    setNumFloors(data.num_floors);
     if (typeof data.num_elevators === 'number') setNumElevators(data.num_elevators);
     if (typeof data.capacity === 'number')      setCapacity(data.capacity);
+    // ── batch window fields ──
+    if (typeof data.batch_active === 'boolean')       setBatchActive(data.batch_active);
+    if (typeof data.batch_countdown_ms === 'number')  setBatchCountdownMs(data.batch_countdown_ms);
+    if (typeof data.batch_queued === 'number')        setBatchQueued(data.batch_queued);
+    // ── emergency priority fields ──
+    if (Array.isArray(data.active_emergencies))       setActiveEmergencies(data.active_emergencies);
+    if (data.current_emergency !== undefined)         setCurrentEmergency(data.current_emergency);
   };
 
   const fetchState = useCallback(async () => {
     try {
       const data = await elevatorApi.getState();
       applyState(data);
-      setConnectionStatus('Connected to Backend (Port 5001)');
+      setConnectionStatus('Connected to Backend (Port 5000)');
     } catch {
-      setConnectionStatus('Backend Disconnected – start: node backend/server.js');
+      setConnectionStatus('Backend Disconnected – start: python backend/app.py');
     }
   }, []);
 
@@ -131,6 +145,32 @@ export default function App() {
     } catch (err) {
       addLog(`Dispatch error: ${err.message}`);
       setPendingRequests((p) => p + 1);
+    }
+  };
+
+  const handleEmergencySubmit = async (floor) => {
+    addLog(`🚨 [EMERGENCY] Request triggered at Floor ${floor}`);
+    try {
+      const res = await elevatorApi.dispatchEmergency(floor);
+      if (res?.state) applyState(res.state);
+      if (res?.emergency?.elevator_id !== null && res?.emergency?.elevator_id !== undefined) {
+        addLog(`🚨 [EMERGENCY] Assigned to Lift ${res.emergency.elevator_id + 1} (${res.emergency.rationale || 'Optimal Lift'})`);
+      } else if (res?.message) {
+        addLog(`🚨 [EMERGENCY] ${res.message}`);
+      }
+    } catch (err) {
+      addLog(`🚨 Emergency Error: ${err.message}`);
+    }
+  };
+
+  const handleResolveEmergency = async (emergencyId, floor) => {
+    addLog(`🚨 Resolving emergency...`);
+    try {
+      const res = await elevatorApi.resolveEmergency(emergencyId, floor);
+      if (res?.state) applyState(res.state);
+      addLog(`✅ [RESOLVED] Emergency on Floor ${res?.emergency?.floor || floor || ''} resolved. Normal dispatch restored.`);
+    } catch (err) {
+      addLog(`Resolve Emergency Error: ${err.message}`);
     }
   };
 
@@ -458,8 +498,15 @@ export default function App() {
           <div>
             <RequestPanel
               onSubmitRequest={handleRequestSubmit}
+              onSubmitEmergency={handleEmergencySubmit}
+              onResolveEmergency={handleResolveEmergency}
               isRunning={isRunning}
               numFloors={numFloors}
+              batchActive={batchActive}
+              batchCountdownMs={batchCountdownMs}
+              batchQueued={batchQueued}
+              activeEmergencies={activeEmergencies}
+              currentEmergency={currentEmergency}
             />
 
             {/* Event Console */}
@@ -498,11 +545,26 @@ export default function App() {
                 {logs.length === 0 ? (
                   <div style={{ color: '#64748b' }}>Waiting for system events…</div>
                 ) : (
-                  logs.map((log, i) => (
-                    <div key={i} style={{ marginBottom: '4px', lineHeight: '1.4' }}>
-                      {log}
-                    </div>
-                  ))
+                  logs.map((log, i) => {
+                    const isEmergency = log.includes('🚨') || log.includes('EMERGENCY');
+                    const isResolved = log.includes('✅') || log.includes('RESOLVED');
+                    return (
+                      <div
+                        key={i}
+                        style={{
+                          marginBottom: '4px',
+                          lineHeight: '1.4',
+                          color: isEmergency ? '#f87171' : isResolved ? '#4ade80' : '#cbd5e1',
+                          fontWeight: isEmergency || isResolved ? '700' : 'normal',
+                          backgroundColor: isEmergency ? 'rgba(239, 68, 68, 0.1)' : 'transparent',
+                          borderRadius: '4px',
+                          padding: isEmergency ? '2px 4px' : '0',
+                        }}
+                      >
+                        {log}
+                      </div>
+                    );
+                  })
                 )}
               </div>
             </div>

@@ -19,6 +19,8 @@ from lstm_model import LSTMModel
 from data_processor import DataProcessor
 from q_learning_agent import QLearningAgent
 from elevator_env import ElevatorEnvironment
+from batch_dispatcher import RequestBatchDispatcher
+from emergency_dispatcher import EmergencyDispatcher
 
 app = Flask(__name__)
 # Enable CORS for React frontend (Vite port 5173 and CRA port 3000)
@@ -32,6 +34,14 @@ q_agent = QLearningAgent(
 )
 lstm_model = LSTMModel()
 data_processor = DataProcessor()
+
+# 2-second request batching dispatcher
+batch_dispatcher = RequestBatchDispatcher(env, q_agent)
+
+# Priority emergency dispatcher
+emergency_dispatcher = EmergencyDispatcher(env)
+env.emergency_dispatcher = emergency_dispatcher
+batch_dispatcher.set_emergency_dispatcher(emergency_dispatcher)
 
 # Buffer to maintain sliding window of feature records for LSTM inference (seq_len = 10)
 FEATURE_BUFFER = deque(maxlen=10)
@@ -115,7 +125,7 @@ def configure_system():
       { "num_floors": int (2–20), "num_elevators": int (1–5), "capacity": int }
     Caps are enforced server-side. Resets the simulation.
     """
-    global env, q_agent, IS_RUNNING
+    global env, q_agent, batch_dispatcher, IS_RUNNING
     data = request.get_json() or {}
     num_floors    = data.get("num_floors")
     num_elevators = data.get("num_elevators")
@@ -130,6 +140,10 @@ def configure_system():
         num_elevators=env.num_elevators,
         num_floors=env.num_floors,
     )
+    batch_dispatcher = RequestBatchDispatcher(env, q_agent)
+    emergency_dispatcher = EmergencyDispatcher(env)
+    env.emergency_dispatcher = emergency_dispatcher
+    batch_dispatcher.set_emergency_dispatcher(emergency_dispatcher)
     IS_RUNNING = False
     return jsonify({
         "status": "success",
@@ -142,6 +156,8 @@ def start_system():
     """Initializes environment and reloads models."""
     global env, q_agent, lstm_model, IS_RUNNING
     env.reset()
+    batch_dispatcher.reset()
+    emergency_dispatcher.reset()
     IS_RUNNING = True
     initialize_models()
     return jsonify({
@@ -155,6 +171,8 @@ def reset_system():
     """Resets simulator to clean state."""
     global env, IS_RUNNING
     env.reset()
+    batch_dispatcher.reset()
+    emergency_dispatcher.reset()
     IS_RUNNING = False
     return jsonify({
         "status": "success",
@@ -167,6 +185,8 @@ def is_system_idle():
     Returns True when there are no pending requests AND all elevators
     are empty and have no committed targets or assigned stops. In this state the RL agent must NOT move any car.
     """
+    if emergency_dispatcher.get_locked_elevator_ids():
+        return False
     if env.pending_requests:
         return False
     if any(len(passengers) > 0 for passengers in env.elevator_passengers):
@@ -181,9 +201,27 @@ def is_system_idle():
 def run_rl_dispatch_step():
     """
     Executes one end-to-end dispatch cycle using LSTM + Q-Learning.
+    Also checks whether the 2-second batching window has expired and flushes
+    any queued requests before running normal dispatch.
     Returns (None, 0, {}) when the system is idle so callers can skip movement.
     """
     global TOTAL_DISPATCHED
+
+    # ── Emergency Dispatcher tick ──
+    emg_events = emergency_dispatcher.tick()
+    for ev in emg_events:
+        print(f"[Emergency] {ev}")
+
+    # ── 2-second batch window flush ────────────────────────────────────────
+    # tick() is a no-op when no window is open or the window has not yet
+    # expired; it is safe to call unconditionally on every step.
+    batch_actions = batch_dispatcher.tick()
+    if batch_actions:
+        for ba in batch_actions:
+            print(
+                f"[Dispatch] Batch assigned req {ba['req']['id']} "
+                f"F{ba['req']['src']}->F{ba['req']['dst']} -> Lift {ba['elevator_id']}"
+            )
 
     # ── IDLE GUARD: do not dispatch when building has no work ──
     if is_system_idle():
@@ -208,14 +246,28 @@ def run_rl_dispatch_step():
     env.congestion_prediction = congestion_val
     current_state["congestion_prediction"] = congestion_val
 
-    # 2. Centralized Dispatch for any unassigned requests
-    unassigned = env.get_unassigned_requests()
+    # 2. Dispatch any unassigned requests that slipped past the batch window.
+    #    IMPORTANT: requests currently held in an open batch window have
+    #    assigned_to=None but must NOT be dispatched here – they are waiting
+    #    for the 2-second window to close so they can be grouped efficiently.
+    #    Dispatching them immediately is the root cause of "all 3 lifts move".
+    #    ALSO: Elevators currently locked to an emergency must NEVER be overridden!
+    batched_ids     = batch_dispatcher.get_batched_ids()   # IDs in open window
+    locked_lifts    = emergency_dispatcher.get_locked_elevator_ids()
+    unassigned      = [r for r in env.get_unassigned_requests()
+                       if r["id"] not in batched_ids]
     dispatch_action = None
     for req in unassigned:
-        valid_actions, heuristics = env.get_dispatch_candidates(req)
+        raw_actions, raw_heuristics = env.get_dispatch_candidates(req)
+        valid_actions = []
+        heuristics = []
+        for act, h in zip(raw_actions, raw_heuristics):
+            if act[0] not in locked_lifts:
+                valid_actions.append(act)
+                heuristics.append(h)
         if valid_actions:
             act = q_agent.get_dispatch_action(current_state, valid_actions, heuristics)
-            if act:
+            if act and act[0] not in locked_lifts:
                 env.assign_request(req, act[0])
                 if dispatch_action is None:
                     dispatch_action = act
@@ -235,7 +287,10 @@ def run_rl_dispatch_step():
 def add_passenger_request():
     """
     Receives passenger request: {src_floor: int, dst_floor: int}
-    Queues request, performs one dispatch decision step, and returns state.
+    Queues request into the 2-second batching window.
+    Does NOT immediately dispatch; the batch window handles dispatch.
+    A lightweight step is still run to advance active elevators and
+    flush any window that has already expired.
     """
     data = request.get_json() or {}
     src_floor = data.get("src_floor", 1)
@@ -245,14 +300,28 @@ def add_passenger_request():
     if not success:
         return jsonify({
             "status": "error",
-            "message": "Invalid request: source and destination floors must be distinct (1-10)"
+            "message": "Invalid request: source and destination floors must be distinct"
         }), 400
 
+    # Enqueue into batch window (opens window if not already open)
+    new_req = env.pending_requests[-1]
+    batch_dispatcher.enqueue(new_req)
+    print(
+        f"[Request] Received F{src_floor}->F{dst_floor}  "
+        f"batch_status={batch_dispatcher.get_status()}"
+    )
+
+    # Still run a step to advance any already-moving elevators and to check
+    # whether a previously-opened window has now expired.
     next_state, reward, info = run_rl_dispatch_step()
 
     return jsonify({
         "status": "success",
-        "message": f"Dispatched request from Floor {src_floor} to {dst_floor}",
+        "message": (
+            f"Request F{src_floor}->F{dst_floor} queued – "
+            f"batching window active, dispatch in ~"
+            f"{batch_dispatcher.get_status().get('countdown_ms', 0) // 1000}s"
+        ),
         "reward": reward,
         "info": info,
         "state": get_system_state_dict()
@@ -279,8 +348,10 @@ def step_simulation():
 
 def get_system_state_dict():
     """Returns formatted JSON-serializable system state."""
-    state = env.get_state()
-    stats = q_agent.get_stats()
+    state  = env.get_state()
+    stats  = q_agent.get_stats()
+    bstatus = batch_dispatcher.get_status()
+    emg_status = emergency_dispatcher.get_status_summary()
     return {
         "elevator_positions": state["elevator_positions"],
         "elevator_occupancy": state["elevator_occupancy"],
@@ -295,11 +366,71 @@ def get_system_state_dict():
         "epsilon":            stats["epsilon"],
         "step_count":         state["step_count"],
         "is_running":         IS_RUNNING,
-        # ── building config ────────────────────────────────────────────────
+        # ── building config ───────────────────────────────────────────────
         "num_floors":    env.num_floors,
         "num_elevators": env.num_elevators,
         "capacity":      env.capacity,
+        # ── 2-second batching status ──────────────────────────────────────
+        "batch_active":   bstatus["batch_active"],
+        "batch_countdown_ms": bstatus["countdown_ms"],
+        "batch_queued":   bstatus["queued_count"],
+        # ── Emergency priority status ─────────────────────────────────────
+        "has_active_emergency": emg_status["has_active_emergency"],
+        "active_emergencies":   emg_status["active_emergencies"],
+        "current_emergency":    emg_status["current_emergency"],
     }
+
+
+@app.route("/api/batch_status", methods=["GET"])
+def get_batch_status():
+    """Returns the current batching window status for the frontend countdown."""
+    return jsonify(batch_dispatcher.get_status())
+
+@app.route("/api/emergency", methods=["POST"])
+def trigger_emergency():
+    """
+    Submits an emergency-priority request for a specific floor.
+    Bypasses the normal 2-second batching window and assigns the optimal elevator.
+    Body: { "floor": int }
+    """
+    data = request.get_json() or {}
+    raw_floor = data.get("floor", data.get("emergency_floor", data.get("src_floor", 1)))
+    try:
+        floor = int(raw_floor)
+    except (ValueError, TypeError):
+        return jsonify({"status": "error", "message": "Invalid floor number"}), 400
+
+    if floor < 1 or floor > env.num_floors:
+        return jsonify({
+            "status": "error",
+            "message": f"Floor must be between 1 and {env.num_floors}"
+        }), 400
+
+    res = emergency_dispatcher.dispatch_emergency(floor)
+    return jsonify({
+        **res,
+        "state": get_system_state_dict(),
+    })
+
+@app.route("/api/emergency/resolve", methods=["POST"])
+def resolve_emergency_endpoint():
+    """
+    Resolves an active emergency and restores normal dispatch.
+    Body: { "emergency_id": int (optional), "floor": int (optional) }
+    """
+    data = request.get_json() or {}
+    emg_id = data.get("emergency_id", data.get("id"))
+    floor = data.get("floor")
+    res = emergency_dispatcher.resolve_emergency(emg_id, floor)
+    return jsonify({
+        **res,
+        "state": get_system_state_dict(),
+    })
+
+@app.route("/api/emergency/status", methods=["GET"])
+def get_emergency_status_endpoint():
+    """Returns the current emergency status."""
+    return jsonify(emergency_dispatcher.get_status_summary())
 
 @app.route("/api/state", methods=["GET"])
 def get_state():

@@ -225,11 +225,22 @@ def test_4_flask_app_endpoints():
     data = res.get_json()
     assert data["status"] == "success"
     
+    # With 2-second batch window, request is queued first
+    assert data["state"]["batch_active"] is True
+    assert data["state"]["batch_queued"] == 1
+
+    # Wait for 2-second batch window to expire and step
+    import time
+    time.sleep(2.1)
+    res = client.post("/api/step")
+    assert res.status_code == 200
+    data = res.get_json()
+
     positions_after_req = data["state"]["elevator_positions"]
     targets = data["state"]["elevator_targets"]
     active_targets = [t for t in targets if t is not None]
     assert len(active_targets) == 1, f"Exactly 1 elevator should have an active target, got {targets}"
-    print(f"  Dispatched request via API: Targets={targets}, Positions={positions_after_req}")
+    print(f"  Dispatched request via API after batch window: Targets={targets}, Positions={positions_after_req}")
 
     print("  [PASS] Flask API adheres to centralized dispatch and idle rule.\n")
 

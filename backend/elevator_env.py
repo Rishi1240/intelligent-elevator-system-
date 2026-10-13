@@ -216,7 +216,14 @@ class ElevatorEnvironment:
         onboard = list(self.elevator_passengers[e])
         assigned_reqs = [r for r in self.pending_requests if r.get("assigned_to") == e]
 
-        if not onboard and not assigned_reqs:
+        # Active emergency stops for elevator e
+        emg_stops = set()
+        if hasattr(self, "emergency_dispatcher") and self.emergency_dispatcher:
+            for emg in self.emergency_dispatcher.get_all_active():
+                if emg["status"] == "dispatched" and emg["elevator_id"] == e:
+                    emg_stops.add(emg["floor"])
+
+        if not onboard and not assigned_reqs and not emg_stops:
             self.assigned_stops[e] = []
             self.committed_targets[e] = None
             return
@@ -244,6 +251,9 @@ class ElevatorEnvironment:
                     heading = -1
                 else:
                     heading = 1 if first_r["dst"] > pos else -1
+            elif emg_stops:
+                first_s = list(emg_stops)[0]
+                heading = 1 if first_s >= pos else -1
 
         if heading >= 0:
             # UP heading
@@ -255,6 +265,9 @@ class ElevatorEnvironment:
                 if r["dst"] > r["src"] and r["src"] >= pos:
                     up_stops.add(r["src"])
                     up_stops.add(r["dst"])
+            for s in emg_stops:
+                if s >= pos:
+                    up_stops.add(s)
 
             leg1 = sorted(up_stops)
 
@@ -266,6 +279,9 @@ class ElevatorEnvironment:
                 if r["dst"] < r["src"] or r["src"] < pos:
                     down_stops.add(r["src"])
                     down_stops.add(r["dst"])
+            for s in emg_stops:
+                if s < pos:
+                    down_stops.add(s)
 
             leg2 = sorted(down_stops, reverse=True)
             combined = leg1 + [s for s in leg2 if s not in leg1]
@@ -279,6 +295,9 @@ class ElevatorEnvironment:
                 if r["dst"] < r["src"] and r["src"] <= pos:
                     down_stops.add(r["src"])
                     down_stops.add(r["dst"])
+            for s in emg_stops:
+                if s <= pos:
+                    down_stops.add(s)
 
             leg1 = sorted(down_stops, reverse=True)
 
@@ -290,6 +309,9 @@ class ElevatorEnvironment:
                 if r["dst"] > r["src"] or r["src"] > pos:
                     up_stops.add(r["src"])
                     up_stops.add(r["dst"])
+            for s in emg_stops:
+                if s > pos:
+                    up_stops.add(s)
 
             leg2 = sorted(up_stops)
             combined = leg1 + [s for s in leg2 if s not in leg1]
