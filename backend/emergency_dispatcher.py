@@ -12,8 +12,8 @@ import threading
 class EmergencyDispatcher:
     """
     Manages emergency requests, selects the optimal elevator based on lowest
-    safe response time, prevents duplicate dispatches, and protects emergency
-    routes from normal Q-learning overrides.
+    safe response time, prevents duplicate dispatches, implements deterministic tie-breaking,
+    and protects emergency routes from normal Q-learning overrides.
     """
 
     def __init__(self, env):
@@ -29,6 +29,42 @@ class EmergencyDispatcher:
             self.active_emergencies.clear()
             self.event_queue.clear()
 
+    def _enrich_emergency(self, emg: dict) -> dict:
+        """
+        Dynamically enriches an emergency record with real-time elevator telemetry:
+        current floor, live distance, target floor, and movement direction.
+        """
+        d = dict(emg)
+        e = d.get("elevator_id")
+        floor = d.get("floor", 1)
+
+        if e is not None and e < self.env.num_elevators:
+            curr_pos = self.env.elevator_positions[e]
+            d["current_floor"] = curr_pos
+            d["distance"] = abs(curr_pos - floor)
+            d["target_floor"] = self.env.committed_targets[e]
+
+            # Live status derivation
+            if curr_pos == floor:
+                d["direction"] = "ARRIVED"
+                if d.get("status") not in ("resolved", "unassigned"):
+                    d["status"] = "arrived"
+            elif curr_pos < floor:
+                d["direction"] = "UP"
+                if d.get("status") not in ("resolved", "unassigned"):
+                    d["status"] = "en_route"
+            else:
+                d["direction"] = "DOWN"
+                if d.get("status") not in ("resolved", "unassigned"):
+                    d["status"] = "en_route"
+        else:
+            d["current_floor"] = None
+            d["distance"] = None
+            d["direction"] = "NONE"
+            d["target_floor"] = None
+
+        return d
+
     def get_locked_elevator_ids(self) -> set:
         """
         Returns elevator indices currently committed to an active emergency.
@@ -38,7 +74,8 @@ class EmergencyDispatcher:
             return {
                 emg["elevator_id"]
                 for emg in self.active_emergencies.values()
-                if emg["status"] in ("dispatched", "arrived") and emg["elevator_id"] is not None
+                if emg["status"] in ("en_route", "dispatched", "arrived", "assigned")
+                and emg["elevator_id"] is not None
             }
 
     def get_active_emergency_for_floor(self, floor: int) -> dict | None:
@@ -48,26 +85,26 @@ class EmergencyDispatcher:
         """
         with self.lock:
             for emg in self.active_emergencies.values():
-                if emg["floor"] == floor and emg["status"] in ("dispatched", "arrived"):
-                    return dict(emg)
+                if emg["floor"] == floor and emg["status"] in ("en_route", "dispatched", "arrived", "assigned"):
+                    return self._enrich_emergency(emg)
             return None
 
     def get_all_active(self) -> list:
-        """Returns list of all active (unresolved) emergencies."""
+        """Returns list of all active (unresolved) emergencies with live telemetry."""
         with self.lock:
             return [
-                dict(emg)
+                self._enrich_emergency(emg)
                 for emg in self.active_emergencies.values()
-                if emg["status"] in ("dispatched", "arrived")
+                if emg["status"] in ("en_route", "dispatched", "arrived", "assigned")
             ]
 
     def get_status_summary(self) -> dict:
         """Returns summary dictionary for API serialization."""
         with self.lock:
             active = [
-                dict(emg)
+                self._enrich_emergency(emg)
                 for emg in self.active_emergencies.values()
-                if emg["status"] in ("dispatched", "arrived")
+                if emg["status"] in ("en_route", "dispatched", "arrived", "assigned")
             ]
             has_active = len(active) > 0
             primary = active[0] if has_active else None
@@ -81,12 +118,11 @@ class EmergencyDispatcher:
         """
         Selects elevator with lowest safe estimated response time.
         Considers position, direction, occupancy, capacity, and current routes.
+        Implements deterministic multi-criteria tie-breaking.
         Returns: (elevator_id or None, response_cost, rationale)
         """
         locked = self.get_locked_elevator_ids()
-        best_e = None
-        best_cost = float("inf")
-        best_rationale = "No suitable elevator available"
+        candidates = []
 
         for e in range(self.env.num_elevators):
             # 1. Skip if already locked to another emergency
@@ -107,10 +143,7 @@ class EmergencyDispatcher:
             if pos == floor:
                 cost = 0.0
                 rationale = f"Lift {e + 1} is already at Floor {floor}"
-                if cost < best_cost:
-                    best_cost = cost
-                    best_e = e
-                    best_rationale = rationale
+                candidates.append((cost, occ, len(stops), e, rationale))
                 continue
 
             # Case B: Completely idle elevator
@@ -119,43 +152,55 @@ class EmergencyDispatcher:
                 dist = abs(pos - floor)
                 cost = dist * 1.0  # direct distance
                 rationale = f"Idle Lift {e + 1} at Floor {pos} (distance: {dist})"
-                if cost < best_cost:
-                    best_cost = cost
-                    best_e = e
-                    best_rationale = rationale
+                candidates.append((cost, occ, len(stops), e, rationale))
                 continue
 
             # Case C: Moving elevator heading toward emergency floor along existing route
             heading_up = (target is not None and target > pos) or (stops and stops[0] > pos)
             heading_down = (target is not None and target < pos) or (stops and stops[0] < pos)
 
-            can_safely_insert = False
-            cost = float("inf")
-            rationale = ""
             if heading_up and pos < floor:
-
                 furthest = max(stops or [target or pos])
                 # Only if floor is on the way or extends the current upward run
                 if floor <= furthest or occ == 0:
-                    can_safely_insert = True
                     dist = floor - pos
                     cost = dist * 1.0 + 0.3  # small bias preferring pure idle if equal distance
                     rationale = f"En-route upward Lift {e + 1} at Floor {pos} (distance: {dist})"
+                    candidates.append((cost, occ, len(stops), e, rationale))
             elif heading_down and pos > floor:
                 furthest = min(stops or [target or pos])
                 # Only if floor is on the way or extends the current downward run
                 if floor >= furthest or occ == 0:
-                    can_safely_insert = True
                     dist = pos - floor
                     cost = dist * 1.0 + 0.3
                     rationale = f"En-route downward Lift {e + 1} at Floor {pos} (distance: {dist})"
+                    candidates.append((cost, occ, len(stops), e, rationale))
 
-            if can_safely_insert and cost < best_cost:
-                best_cost = cost
-                best_e = e
-                best_rationale = rationale
+        if not candidates:
+            return None, float("inf"), "No suitable elevator available without capacity or route violation"
 
-        return best_e, best_cost, best_rationale
+        # Deterministic sorting: (cost, occupancy, num_stops, elevator_id)
+        candidates.sort(key=lambda c: (c[0], c[1], c[2], c[3]))
+        best_candidate = candidates[0]
+        best_cost, best_occ, best_num_stops, best_e, base_rationale = best_candidate
+
+        # Check for ties at lowest cost
+        tied_at_cost = [c for c in candidates if abs(c[0] - best_cost) < 1e-4]
+        if len(tied_at_cost) > 1:
+            tie_ids = [f"Lift {c[3] + 1}" for c in tied_at_cost]
+            tie_reason = (
+                f"Tie-breaker among {', '.join(tie_ids)} (all cost {best_cost:.1f}): "
+                f"selected Lift {best_e + 1} (lowest occupancy: {best_occ}, stops: {best_num_stops})"
+            )
+            full_rationale = f"{base_rationale} [{tie_reason}]"
+        else:
+            full_rationale = base_rationale
+
+        return best_e, best_cost, full_rationale
+
+    def trigger_emergency(self, floor: int) -> dict:
+        """Alias for dispatch_emergency."""
+        return self.dispatch_emergency(floor)
 
     def dispatch_emergency(self, floor: int) -> dict:
         """
@@ -198,13 +243,13 @@ class EmergencyDispatcher:
                 return {
                     "status": "no_lift_available",
                     "message": f"No elevator can safely reach Floor {floor} at this time",
-                    "emergency": emg,
+                    "emergency": self._enrich_emergency(emg),
                 }
 
             # 3. Elevator found - assign and configure route
             pos = self.env.elevator_positions[best_e]
             is_already_there = (pos == floor)
-            status = "arrived" if is_already_there else "dispatched"
+            status = "arrived" if is_already_there else "en_route"
             arrived_at = now if is_already_there else None
 
             emg = {
@@ -248,7 +293,7 @@ class EmergencyDispatcher:
             return {
                 "status": "success",
                 "message": f"Emergency priority assigned to Lift {best_e + 1}",
-                "emergency": emg,
+                "emergency": self._enrich_emergency(emg),
             }
 
     def resolve_emergency(self, emergency_id: int | None = None, floor: int | None = None) -> dict:
@@ -262,14 +307,14 @@ class EmergencyDispatcher:
                 target_emg = self.active_emergencies.get(emergency_id)
             elif floor is not None:
                 for emg in self.active_emergencies.values():
-                    if emg["floor"] == floor and emg["status"] in ("dispatched", "arrived"):
+                    if emg["floor"] == floor and emg["status"] in ("en_route", "dispatched", "arrived", "assigned"):
                         target_emg = emg
                         break
             else:
                 # Resolve most recent active emergency
                 active = [
                     emg for emg in self.active_emergencies.values()
-                    if emg["status"] in ("dispatched", "arrived")
+                    if emg["status"] in ("en_route", "dispatched", "arrived", "assigned")
                 ]
                 if active:
                     target_emg = active[-1]
@@ -285,8 +330,7 @@ class EmergencyDispatcher:
             e = target_emg["elevator_id"]
 
             if e is not None and e < self.env.num_elevators:
-                # Remove emergency floor from assigned stops if arrived
-                curr_pos = self.env.elevator_positions[e]
+                # Remove emergency floor from assigned stops if present
                 self.env.assigned_stops[e] = [s for s in self.env.assigned_stops[e] if s != target_emg["floor"]]
                 self.env._recompute_route(e)
 
@@ -295,7 +339,7 @@ class EmergencyDispatcher:
             return {
                 "status": "success",
                 "message": f"Emergency on Floor {target_emg['floor']} successfully resolved",
-                "emergency": target_emg,
+                "emergency": self._enrich_emergency(target_emg),
             }
 
     def tick(self) -> list:
@@ -307,7 +351,7 @@ class EmergencyDispatcher:
         events = []
         with self.lock:
             for emg in self.active_emergencies.values():
-                if emg["status"] == "dispatched" and emg["elevator_id"] is not None:
+                if emg["status"] in ("en_route", "dispatched", "assigned") and emg["elevator_id"] is not None:
                     e = emg["elevator_id"]
                     if e < self.env.num_elevators and self.env.elevator_positions[e] == emg["floor"]:
                         emg["status"] = "arrived"

@@ -3,6 +3,7 @@ import ElevatorShaft from './components/ElevatorShaft';
 import CongestionMeter from './components/CongestionMeter';
 import RequestPanel from './components/RequestPanel';
 import StatsPanel from './components/StatsPanel';
+import SimulationTimeControl from './components/SimulationTimeControl';
 import { elevatorApi } from './api/elevatorApi';
 
 // ── hard limits mirrored from server ─────────────────────────────────────────
@@ -39,6 +40,23 @@ export default function App() {
   const [activeEmergencies, setActiveEmergencies] = useState([]);
   const [currentEmergency,  setCurrentEmergency]  = useState(null);
 
+  // ── simulation clock & predictive telemetry state ─────────────────
+  const [clockState,          setClockState]          = useState(null);
+  const [lstmMode,            setLstmMode]            = useState('loaded');
+  const [lastPredictionTime,  setLastPredictionTime]  = useState('');
+  const [predictionHorizon,   setPredictionHorizon]   = useState(5);
+  const [predictiveEnabled,   setPredictiveEnabled]   = useState(true);
+  const [positioningStatus,   setPositioningStatus]   = useState('inactive');
+  const [targetFloor,         setTargetFloor]         = useState(null);
+  const [targetDemand,        setTargetDemand]        = useState(0.0);
+  const [assignedElevators,   setAssignedElevators]   = useState([]);
+  const [elevatorOpsStatus,   setElevatorOpsStatus]   = useState([]);
+  const [floorDemandT5,       setFloorDemandT5]       = useState([]);
+  const [assignedAllocations, setAssignedAllocations] = useState([]);
+  const [eligibleElevatorsCount, setEligibleElevatorsCount] = useState(0);
+  const [lastDecisionLog,     setLastDecisionLog]     = useState('');
+  const [highThreshold,       setHighThreshold]       = useState(0.55);
+
   // ── UI state ──────────────────────────────────────────────────────────────
   const [logs,             setLogs]             = useState([]);
   const [connectionStatus, setConnectionStatus] = useState('Checking backend...');
@@ -54,8 +72,14 @@ export default function App() {
   isRunningRef.current = isRunning;
 
   const addLog = (message) => {
+    if (!message) return;
     const t = new Date().toLocaleTimeString();
-    setLogs((prev) => [`[${t}] ${message}`, ...prev.slice(0, 29)]);
+    setLogs((prev) => {
+      if (prev.length > 0 && prev[0].replace(/^\[.*?\]\s*/, '') === message) {
+        return prev;
+      }
+      return [`[${t}] ${message}`, ...prev.slice(0, 49)];
+    });
   };
 
   const applyState = (data) => {
@@ -83,6 +107,28 @@ export default function App() {
     // ── emergency priority fields ──
     if (Array.isArray(data.active_emergencies))       setActiveEmergencies(data.active_emergencies);
     if (data.current_emergency !== undefined)         setCurrentEmergency(data.current_emergency);
+    if (Array.isArray(data.emergency_events) && data.emergency_events.length > 0) {
+      data.emergency_events.forEach((ev) => addLog(ev));
+    }
+    if (Array.isArray(data.dispatch_events) && data.dispatch_events.length > 0) {
+      data.dispatch_events.forEach((ev) => addLog(ev));
+    }
+    // ── clock & predictive fields ──
+    if (data.clock) setClockState(data.clock);
+    if (data.lstm_mode) setLstmMode(data.lstm_mode);
+    if (data.last_prediction_time) setLastPredictionTime(data.last_prediction_time);
+    if (typeof data.prediction_horizon_min === 'number') setPredictionHorizon(data.prediction_horizon_min);
+    if (typeof data.predictive_positioning_enabled === 'boolean') setPredictiveEnabled(data.predictive_positioning_enabled);
+    if (data.predictive_positioning_status) setPositioningStatus(data.predictive_positioning_status);
+    if (data.predicted_target_floor !== undefined) setTargetFloor(data.predicted_target_floor);
+    if (typeof data.predicted_target_demand === 'number') setTargetDemand(data.predicted_target_demand);
+    if (Array.isArray(data.assigned_predictive_elevators)) setAssignedElevators(data.assigned_predictive_elevators);
+    if (Array.isArray(data.elevator_operational_status)) setElevatorOpsStatus(data.elevator_operational_status);
+    if (Array.isArray(data.floor_demand_t5)) setFloorDemandT5(data.floor_demand_t5);
+    if (Array.isArray(data.assigned_allocations)) setAssignedAllocations(data.assigned_allocations);
+    if (typeof data.eligible_elevators_count === 'number') setEligibleElevatorsCount(data.eligible_elevators_count);
+    if (typeof data.last_decision_log === 'string') setLastDecisionLog(data.last_decision_log);
+    if (typeof data.high_congestion_threshold === 'number') setHighThreshold(data.high_congestion_threshold);
   };
 
   const fetchState = useCallback(async () => {
@@ -102,17 +148,18 @@ export default function App() {
     return () => clearInterval(id);
   }, [fetchState]);
 
-  // Trigger sim steps every 3 s when running
+  // Trigger sim steps when running (steps faster at 1.5s during emergency for responsiveness)
   useEffect(() => {
     if (!isRunning) return;
+    const intervalMs = (activeEmergencies.length > 0 || currentEmergency) ? 1500 : 3000;
     const id = setInterval(async () => {
       try {
         const res = await elevatorApi.stepSimulation();
         if (res?.state) applyState(res.state);
       } catch { /* backend offline */ }
-    }, 3000);
+    }, intervalMs);
     return () => clearInterval(id);
-  }, [isRunning]);
+  }, [isRunning, activeEmergencies.length, currentEmergency]);
 
   // ── handlers ──────────────────────────────────────────────────────────────
   const handleToggleRunning = async () => {
@@ -135,13 +182,12 @@ export default function App() {
   };
 
   const handleRequestSubmit = async (src, dst) => {
-    addLog(`Summon: F${src} → F${dst}`);
     try {
       const res = await elevatorApi.dispatchRequest(src, dst);
       if (res?.state) {
         applyState(res.state);
-        addLog(`Dispatched: ${res.message || 'Elevator allocated'}`);
       }
+      setIsRunning(true);
     } catch (err) {
       addLog(`Dispatch error: ${err.message}`);
       setPendingRequests((p) => p + 1);
@@ -153,8 +199,15 @@ export default function App() {
     try {
       const res = await elevatorApi.dispatchEmergency(floor);
       if (res?.state) applyState(res.state);
+      setIsRunning(true);
       if (res?.emergency?.elevator_id !== null && res?.emergency?.elevator_id !== undefined) {
-        addLog(`🚨 [EMERGENCY] Assigned to Lift ${res.emergency.elevator_id + 1} (${res.emergency.rationale || 'Optimal Lift'})`);
+        const liftNum = res.emergency.elevator_id + 1;
+        const curFloor = res.emergency.current_floor ?? '—';
+        const dist = res.emergency.distance ?? '—';
+        addLog(`🚨 [EMERGENCY] Assigned to Lift ${liftNum} (At Floor ${curFloor}, distance ${dist} floors)`);
+        if (res.emergency.rationale) {
+          addLog(`ℹ️ [SELECTION] ${res.emergency.rationale}`);
+        }
       } else if (res?.message) {
         addLog(`🚨 [EMERGENCY] ${res.message}`);
       }
@@ -425,8 +478,33 @@ export default function App() {
           </form>
         )}
 
+        {/* ── Simulation Time and Predictive Control Panel ── */}
+        <SimulationTimeControl
+          clockState={clockState}
+          isRunning={isRunning}
+          lstmMode={lstmMode}
+          lastPredictionTime={lastPredictionTime}
+          predictionHorizon={predictionHorizon}
+          predictiveEnabled={predictiveEnabled}
+          onStateUpdate={applyState}
+          addLog={addLog}
+        />
+
         {/* ── Congestion Meter ── */}
-        <CongestionMeter congestionLevel={congestionLevel} />
+        <CongestionMeter
+          congestionLevel={congestionLevel}
+          horizonMin={predictionHorizon}
+          targetFloor={targetFloor}
+          targetDemand={targetDemand}
+          positioningStatus={positioningStatus}
+          assignedElevators={assignedElevators}
+          floorDemandT5={floorDemandT5}
+          assignedAllocations={assignedAllocations}
+          eligibleElevatorsCount={eligibleElevatorsCount}
+          lastDecisionLog={lastDecisionLog}
+          highThreshold={highThreshold}
+          numFloors={numFloors}
+        />
 
         {/* ── Stats Telemetry Panel ── */}
         <StatsPanel
@@ -479,18 +557,28 @@ export default function App() {
                 flexWrap: 'wrap',
               }}
             >
-              {elevatorPositions.map((pos, idx) => (
-                <ElevatorShaft
-                  key={idx}
-                  elevatorId={idx + 1}
-                  currentFloor={pos || 1}
-                  occupancy={occupancy[idx] || 0}
-                  capacity={capacity}
-                  numFloors={numFloors}
-                  assignedStops={assignedStops[idx] || []}
-                  targetFloor={elevatorTargets[idx]}
-                />
-              ))}
+              {elevatorPositions.map((pos, idx) => {
+                const emgForThisLift = activeEmergencies.find(
+                  (em) => em.elevator_id === idx && ['en_route', 'dispatched', 'arrived', 'assigned'].includes(em.status)
+                );
+                const isPredAssigned = assignedElevators.includes(idx);
+                const opStatus = elevatorOpsStatus[idx] || (isPredAssigned ? 'repositioning' : 'idle');
+                return (
+                  <ElevatorShaft
+                    key={idx}
+                    elevatorId={idx + 1}
+                    currentFloor={pos || 1}
+                    occupancy={occupancy[idx] || 0}
+                    capacity={capacity}
+                    numFloors={numFloors}
+                    assignedStops={assignedStops[idx] || []}
+                    targetFloor={elevatorTargets[idx]}
+                    emergencyInfo={emgForThisLift}
+                    operationalStatus={opStatus}
+                    predictiveTarget={isPredAssigned ? targetFloor : null}
+                  />
+                );
+              })}
             </div>
           </div>
 
@@ -502,6 +590,8 @@ export default function App() {
               onResolveEmergency={handleResolveEmergency}
               isRunning={isRunning}
               numFloors={numFloors}
+              elevatorPositions={elevatorPositions}
+              elevatorTargets={elevatorTargets}
               batchActive={batchActive}
               batchCountdownMs={batchCountdownMs}
               batchQueued={batchQueued}

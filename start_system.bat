@@ -11,17 +11,23 @@ echo 5. Launch React Frontend Web Dashboard
 echo.
 set /p choice="Select an option (1-5): "
 
+if exist .venv\Scripts\python.exe (
+    set PY_CMD=.venv\Scripts\python.exe
+) else (
+    set PY_CMD=python
+)
+
 if "%choice%"=="1" (
-    python complete_elevator_system.py
+    %PY_CMD% complete_elevator_system.py
 )
 if "%choice%"=="2" (
-    python backend\app.py
+    %PY_CMD% backend\app.py
 )
 if "%choice%"=="3" (
-    python generate_training_data.py
+    %PY_CMD% generate_training_data_future.py
 )
 if "%choice%"=="4" (
-    cd backend && python train_lstm.py
+    %PY_CMD% backend\train_lstm.py
 )
 if "%choice%"=="5" (
     cd frontend && npm install && npm run dev

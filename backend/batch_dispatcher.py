@@ -242,69 +242,141 @@ class RequestBatchDispatcher:
 
     # -- lift selection -------------------------------------------------------
 
+    def drain_events(self) -> list:
+        """Returns and clears all pending formatted dispatch event messages."""
+        with self._lock:
+            if not hasattr(self, "_drained_events"):
+                self._drained_events = []
+            evs = list(self._drained_events)
+            self._drained_events.clear()
+            return evs
+
     def _dispatch_group(self, group: list) -> list:
         """
-        Find the best single lift for the group.  Falls back to per-request
-        Q-agent dispatch when no single lift can accommodate the full group.
-        Returns list of {"elevator_id": int, "req": dict} records.
+        Finds the best lift for the group, or assigns as many as fit to the best lift
+        and routes excess demand to the next suitable lift (capacity-based split).
+        Returns list of dispatch action dictionaries.
         """
-        env     = self._env
+        env = self._env
         q_agent = self._q_agent
+        actions = []
+        if not hasattr(self, "_drained_events"):
+            self._drained_events = []
 
-        best_lift = self._find_best_lift_for_group(group)
-        actions   = []
+        remaining_group = [r for r in group if r["id"] not in self._dispatched_ids]
 
-        if best_lift is not None:
-            for req in group:
-                if req["id"] in self._dispatched_ids:
-                    continue
-                env.assign_request(req, best_lift)
-                self._dispatched_ids.add(req["id"])
-                self._log.info(
-                    "[Batch] Assigned req %s F%s->F%s -> Lift %d",
-                    req["id"], req["src"], req["dst"], best_lift,
-                )
-                actions.append({"elevator_id": best_lift, "req": req})
-            return actions
-
-        # No single lift can serve all – dispatch each individually
         locked_lifts = set()
         if self._emergency_dispatcher:
             locked_lifts = self._emergency_dispatcher.get_locked_elevator_ids()
 
-        for req in group:
-            if req["id"] in self._dispatched_ids:
-                continue
-            raw_actions, raw_heuristics = env.get_dispatch_candidates(req)
-            valid_actions = []
-            heuristics = []
-            for act, h in zip(raw_actions, raw_heuristics):
-                if act[0] not in locked_lifts:
-                    valid_actions.append(act)
-                    heuristics.append(h)
+        while remaining_group:
+            # 1. Try to find a single lift that can accommodate all remaining requests
+            best_lift = self._find_best_lift_for_group(remaining_group)
 
-            if not valid_actions:
-                self._log.warning(
-                    "[Batch] No valid lift for req %s F%s->F%s – left pending",
-                    req["id"], req["src"], req["dst"],
+            if best_lift is not None:
+                sim = env.simulate_projected_occupancies(best_lift, remaining_group)
+                had_work = bool(
+                    env.elevator_passengers[best_lift]
+                    or env.committed_targets[best_lift]
+                    or env.assigned_stops[best_lift]
+                    or any(r.get("assigned_to") == best_lift for r in env.pending_requests)
                 )
-                continue
-            current_state = env.get_state()
-            act = q_agent.get_dispatch_action(current_state, valid_actions, heuristics)
-            if act and act[0] not in locked_lifts:
-                env.assign_request(req, act[0])
-                self._dispatched_ids.add(req["id"])
-                self._log.info(
-                    "[Batch] Individually assigned req %s F%s->F%s -> Lift %d",
-                    req["id"], req["src"], req["dst"], act[0],
+                for req in remaining_group:
+                    env.assign_request(req, best_lift)
+                    self._dispatched_ids.add(req["id"])
+                    occ_at_pickup = sim["occupancy_at_pickup"].get(req["src"], len(env.elevator_passengers[best_lift]))
+                    if had_work:
+                        reason = f"Approaching F{req['src']} with capacity available (in-flight route sharing)"
+                        log_msg = f"[DISPATCH] Req #{req['id']} (F{req['src']}→F{req['dst']}): Joined existing route on Lift {best_lift + 1} | Reason: {reason} | Projected occ at pickup: {occ_at_pickup}/{env.capacity}"
+                    else:
+                        reason = f"Idle Lift {best_lift + 1} dispatched (lowest startup & travel cost)"
+                        log_msg = f"[DISPATCH] Req #{req['id']} (F{req['src']}→F{req['dst']}): Assigned to Lift {best_lift + 1} | Reason: {reason} | Projected occ at pickup: {occ_at_pickup}/{env.capacity}"
+                        had_work = True
+
+                    self._log.info(log_msg)
+                    self._drained_events.append(log_msg)
+                    actions.append({
+                        "elevator_id": best_lift,
+                        "req": req,
+                        "joined_existing": had_work,
+                        "reason": reason,
+                        "projected_occupancy": occ_at_pickup,
+                        "capacity": env.capacity,
+                        "log_message": log_msg,
+                    })
+                break
+
+            # 2. No single lift can accommodate ALL remaining requests -> Capacity Split!
+            best_candidate = None
+            best_fit_count = 0
+            best_cand_cost = float("inf")
+
+            for e in range(env.num_elevators):
+                if e in locked_lifts:
+                    continue
+                fit_count = env.max_accommodatable(e, remaining_group)
+                if fit_count > 0:
+                    cost = sum(env.calculate_insertion_cost(e, req) for req in remaining_group[:fit_count])
+                    if fit_count > best_fit_count or (fit_count == best_fit_count and cost < best_cand_cost):
+                        best_candidate = e
+                        best_fit_count = fit_count
+                        best_cand_cost = cost
+
+            if best_candidate is not None and best_fit_count > 0:
+                accommodated = remaining_group[:best_fit_count]
+                excess = remaining_group[best_fit_count:]
+                sim = env.simulate_projected_occupancies(best_candidate, accommodated)
+                had_work = bool(
+                    env.elevator_passengers[best_candidate]
+                    or env.committed_targets[best_candidate]
+                    or env.assigned_stops[best_candidate]
+                    or any(r.get("assigned_to") == best_candidate for r in env.pending_requests)
                 )
-                actions.append({"elevator_id": act[0], "req": req})
+
+                for req in accommodated:
+                    env.assign_request(req, best_candidate)
+                    self._dispatched_ids.add(req["id"])
+                    occ_at_pickup = sim["occupancy_at_pickup"].get(req["src"], len(env.elevator_passengers[best_candidate]))
+                    reason = f"Capacity-bounded assignment ({best_fit_count} seated)"
+                    log_msg = f"[DISPATCH] Req #{req['id']} (F{req['src']}→F{req['dst']}): Assigned to Lift {best_candidate + 1} | Reason: {reason} | Projected occ at pickup: {occ_at_pickup}/{env.capacity}"
+                    self._log.info(log_msg)
+                    self._drained_events.append(log_msg)
+                    actions.append({
+                        "elevator_id": best_candidate,
+                        "req": req,
+                        "joined_existing": had_work,
+                        "reason": reason,
+                        "projected_occupancy": occ_at_pickup,
+                        "capacity": env.capacity,
+                        "log_message": log_msg,
+                    })
+
+                if excess:
+                    split_msg = f"[CAPACITY SPLIT] Lift {best_candidate + 1} at capacity ({env.capacity}/{env.capacity}) – routing {len(excess)} excess passenger(s) to next available lift"
+                    self._log.info(split_msg)
+                    self._drained_events.append(split_msg)
+                    actions.append({
+                        "capacity_split": True,
+                        "log_message": split_msg,
+                        "elevator_id": best_candidate,
+                    })
+
+                remaining_group = excess
+            else:
+                # All elevators at capacity – leave remaining requests pending
+                for req in remaining_group:
+                    self._log.warning(
+                        "[Batch] All elevators at capacity for req %s F%s->F%s – queued for next available lift",
+                        req["id"], req["src"], req["dst"],
+                    )
+                break
+
         return actions
 
     def _find_best_lift_for_group(self, group: list):
         """
         Returns the elevator_id whose total insertion cost across all group
-        requests is lowest (and can_accommodate all of them), else None.
+        requests is lowest AND can accommodate all of them via simulated route, else None.
         """
         env       = self._env
         best_lift = None
@@ -317,14 +389,11 @@ class RequestBatchDispatcher:
         for e in range(env.num_elevators):
             if e in locked_lifts:
                 continue
-            total_cost = 0.0
-            feasible   = True
-            for req in group:
-                if not env.can_accommodate(e, req):
-                    feasible = False
-                    break
-                total_cost += env.calculate_insertion_cost(e, req)
-            if feasible and total_cost < best_cost:
+            sim = env.simulate_projected_occupancies(e, group)
+            if not sim["feasible"]:
+                continue
+            total_cost = sum(env.calculate_insertion_cost(e, req) for req in group)
+            if total_cost < best_cost:
                 best_cost = total_cost
                 best_lift = e
 

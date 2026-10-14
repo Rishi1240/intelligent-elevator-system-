@@ -35,6 +35,7 @@ class QLearningAgent:
 
         # Q-table: mapping state_tuple -> dict(action_tuple -> Q_value)
         self.q_table = defaultdict(lambda: defaultdict(float))
+        self.last_decision_source = "none"
 
     def _encode_state(self, state_dict):
         """
@@ -81,6 +82,7 @@ class QLearningAgent:
 
         if random.random() < self.epsilon:
             # Exploration strictly among valid actions, biased by heuristic suitability if provided
+            self.last_decision_source = "heuristic"
             if heuristic_scores and len(heuristic_scores) == len(valid_actions):
                 total_h = sum(max(0.1, h) for h in heuristic_scores)
                 weights = [max(0.1, h) / total_h for h in heuristic_scores]
@@ -91,6 +93,7 @@ class QLearningAgent:
         state_actions = self.q_table[state_key]
 
         if not state_actions:
+            self.last_decision_source = "heuristic"
             if heuristic_scores:
                 best_idx = max(range(len(valid_actions)), key=lambda i: heuristic_scores[i])
                 return valid_actions[best_idx]
@@ -102,6 +105,7 @@ class QLearningAgent:
             return q_val + h_bonus
 
         best_idx = max(range(len(valid_actions)), key=lambda i: action_score(i, valid_actions[i]))
+        self.last_decision_source = "q_learning"
         return valid_actions[best_idx]
 
     def get_action(self, state_dict):

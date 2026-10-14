@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 
 /**
  * RequestPanel Component
@@ -11,6 +11,8 @@ export default function RequestPanel({
   onResolveEmergency,
   isRunning,
   numFloors = 10,
+  elevatorPositions = [],
+  elevatorTargets = [],
   batchActive = false,
   batchCountdownMs = 0,
   batchQueued = 0,
@@ -25,6 +27,10 @@ export default function RequestPanel({
   const [emergencyFloor, setEmergencyFloor] = useState(1);
   const [submittingEmergency, setSubmittingEmergency] = useState(false);
   const [resolvingEmergency, setResolvingEmergency] = useState(false);
+
+  // Debounce refs to prevent accidental duplicate rapid clicks
+  const lastSubmitTimeRef = useRef(0);
+  const lastEmgSubmitTimeRef = useRef(0);
 
   // Derive a display-friendly seconds value from the ms countdown
   const batchSecondsLeft = Math.ceil(batchCountdownMs / 1000);
@@ -41,6 +47,12 @@ export default function RequestPanel({
       return;
     }
 
+    const now = Date.now();
+    if (now - lastSubmitTimeRef.current < 600) {
+      return; // Debounce rapid clicks
+    }
+    lastSubmitTimeRef.current = now;
+
     setSubmitting(true);
     try {
       await onSubmitRequest(Number(srcFloor), Number(dstFloor));
@@ -55,6 +67,12 @@ export default function RequestPanel({
   const handleEmergencySubmit = async (e) => {
     e.preventDefault();
     if (!onSubmitEmergency) return;
+
+    const now = Date.now();
+    if (now - lastEmgSubmitTimeRef.current < 600) {
+      return; // Debounce rapid emergency clicks
+    }
+    lastEmgSubmitTimeRef.current = now;
 
     setSubmittingEmergency(true);
     try {
@@ -241,20 +259,29 @@ export default function RequestPanel({
 
         <button
           type="button"
-          onClick={() => handleQuickPreset(Math.max(numFloors - 1, 2), 1)}
+          onClick={() => handleQuickPreset(Math.ceil(numFloors / 2), 1)}
           style={quickBtnStyle}
-          title="Load Evening Exit scenario into the form"
+          title="Load Afternoon scenario into the form"
         >
-          🌆 Evening Exit (F{Math.max(numFloors - 1, 2)}→F1)
+          ☀️ Afternoon (F{Math.ceil(numFloors / 2)}→F1)
         </button>
 
         <button
           type="button"
-          onClick={() => handleQuickPreset(Math.ceil(numFloors / 2), 1)}
+          onClick={() => handleQuickPreset(Math.max(numFloors - 1, 2), 1)}
           style={quickBtnStyle}
-          title="Load Lunch Rush scenario into the form"
+          title="Load Evening scenario into the form"
         >
-          ☀️ Lunch Rush (F{Math.ceil(numFloors / 2)}→F1)
+          🌆 Evening (F{Math.max(numFloors - 1, 2)}→F1)
+        </button>
+
+        <button
+          type="button"
+          onClick={() => handleQuickPreset(numFloors, 1)}
+          style={quickBtnStyle}
+          title="Load Night scenario into the form"
+        >
+          🌙 Night (F{numFloors}→F1)
         </button>
       </div>
 
@@ -323,102 +350,127 @@ export default function RequestPanel({
         </div>
 
         {/* Active Emergency Alert Card */}
-        {activeEmg ? (
-          <div
-            style={{
-              backgroundColor: '#450a0a',
-              border: '2px solid #ef4444',
-              borderRadius: '8px',
-              padding: '14px 16px',
-              boxShadow: '0 0 15px rgba(239, 68, 68, 0.35)',
-            }}
-          >
+        {activeEmg ? (() => {
+          const assignedId = activeEmg.elevator_id;
+          const assignedLiftNum = (assignedId !== null && assignedId !== undefined) ? assignedId + 1 : null;
+          const currentLiftFloor = (assignedId !== null && assignedId !== undefined && elevatorPositions[assignedId] !== undefined)
+            ? elevatorPositions[assignedId]
+            : (activeEmg.current_floor ?? '—');
+          const emgFloor = activeEmg.floor;
+          const distance = (typeof currentLiftFloor === 'number')
+            ? Math.abs(currentLiftFloor - emgFloor)
+            : (typeof activeEmg.distance === 'number' ? activeEmg.distance : null);
+          const isArrived = activeEmg.status === 'arrived' || (typeof distance === 'number' && distance === 0);
+
+          return (
             <div
               style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                flexWrap: 'wrap',
-                gap: '8px',
-                marginBottom: '8px',
+                backgroundColor: '#450a0a',
+                border: '2px solid #ef4444',
+                borderRadius: '8px',
+                padding: '14px 16px',
+                boxShadow: '0 0 15px rgba(239, 68, 68, 0.35)',
               }}
             >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span style={{ fontSize: '18px' }}>🚨</span>
-                <span style={{ fontWeight: '800', color: '#fca5a5', fontSize: '14px' }}>
-                  ACTIVE EMERGENCY AT FLOOR {activeEmg.floor}
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: '8px',
+                  marginBottom: '10px',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ fontSize: '18px' }}>🚨</span>
+                  <span style={{ fontWeight: '800', color: '#fca5a5', fontSize: '14px' }}>
+                    ACTIVE EMERGENCY AT FLOOR {emgFloor}
+                  </span>
+                </div>
+                <span
+                  style={{
+                    fontSize: '11px',
+                    fontWeight: '700',
+                    padding: '3px 8px',
+                    borderRadius: '12px',
+                    backgroundColor: isArrived ? '#065f46' : '#991b1b',
+                    color: isArrived ? '#6ee7b7' : '#fecaca',
+                    textTransform: 'uppercase',
+                    border: `1px solid ${isArrived ? '#10b981' : '#f87171'}`,
+                  }}
+                >
+                  {isArrived ? '✓ ARRIVED AT FLOOR' : '⏳ EN ROUTE (HIGH PRIORITY)'}
                 </span>
               </div>
-              <span
-                style={{
-                  fontSize: '11px',
-                  fontWeight: '700',
-                  padding: '3px 8px',
-                  borderRadius: '12px',
-                  backgroundColor:
-                    activeEmg.status === 'arrived' ? '#065f46' : '#991b1b',
-                  color:
-                    activeEmg.status === 'arrived' ? '#6ee7b7' : '#fecaca',
-                  textTransform: 'uppercase',
-                  border: `1px solid ${
-                    activeEmg.status === 'arrived' ? '#10b981' : '#f87171'
-                  }`,
-                }}
-              >
-                {activeEmg.status === 'arrived'
-                  ? '✓ ARRIVED AT FLOOR'
-                  : '⏳ EN ROUTE (HIGH PRIORITY)'}
-              </span>
-            </div>
 
-            <div
-              style={{
-                fontSize: '12px',
-                color: '#fed7aa',
-                lineHeight: '1.5',
-                marginBottom: '12px',
-              }}
-            >
-              <div>
-                <strong>Assigned Elevator:</strong>{' '}
-                {activeEmg.elevator_id !== null && activeEmg.elevator_id !== undefined
-                  ? `Lift ${activeEmg.elevator_id + 1}`
-                  : 'Searching for suitable elevator...'}
-              </div>
-              {activeEmg.rationale && (
-                <div style={{ fontSize: '11px', color: '#fca5a5', marginTop: '2px' }}>
-                  {activeEmg.rationale}
-                </div>
-              )}
-            </div>
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-              <button
-                type="button"
-                onClick={() => handleResolveEmergency(activeEmg)}
-                disabled={resolvingEmergency}
+              <div
                 style={{
-                  backgroundColor: '#10b981',
-                  color: '#ffffff',
-                  border: 'none',
-                  padding: '8px 16px',
-                  borderRadius: '6px',
-                  fontWeight: '700',
                   fontSize: '12px',
-                  cursor: resolvingEmergency ? 'not-allowed' : 'pointer',
-                  boxShadow: '0 0 10px rgba(16, 185, 129, 0.4)',
-                  transition: 'background-color 0.2s',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '6px',
+                  color: '#fed7aa',
+                  lineHeight: '1.6',
+                  marginBottom: '12px',
+                  backgroundColor: 'rgba(0, 0, 0, 0.25)',
+                  padding: '8px 12px',
+                  borderRadius: '6px',
                 }}
               >
-                <span>✓</span>
-                {resolvingEmergency ? 'Resolving...' : 'Resolve Emergency'}
-              </button>
+                <div>
+                  <strong>Assigned Elevator:</strong>{' '}
+                  {assignedLiftNum ? `Lift ${assignedLiftNum}` : 'Searching for suitable elevator...'}
+                  {assignedLiftNum && (
+                    <span style={{ color: '#93c5fd', marginLeft: '8px' }}>
+                      (Currently at Floor {currentLiftFloor})
+                    </span>
+                  )}
+                </div>
+                <div>
+                  <strong>Live Distance:</strong>{' '}
+                  <span style={{ color: isArrived ? '#4ade80' : '#fde047', fontWeight: '700' }}>
+                    {distance !== null ? (distance === 0 ? '0 floors (Arrived)' : `${distance} floor${distance !== 1 ? 's' : ''} away`) : '—'}
+                  </span>
+                </div>
+                <div>
+                  <strong>Status:</strong>{' '}
+                  <span style={{ color: isArrived ? '#4ade80' : '#f87171', fontWeight: '700' }}>
+                    {isArrived ? 'Reserved & Stationary at Emergency Floor' : (currentLiftFloor < emgFloor ? '▲ Moving Upward to Floor ' + emgFloor : '▼ Moving Downward to Floor ' + emgFloor)}
+                  </span>
+                </div>
+                {activeEmg.rationale && (
+                  <div style={{ fontSize: '11px', color: '#fca5a5', marginTop: '4px', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '4px' }}>
+                    <strong>Dispatch Rationale:</strong> {activeEmg.rationale}
+                  </div>
+                )}
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                <button
+                  type="button"
+                  onClick={() => handleResolveEmergency(activeEmg)}
+                  disabled={resolvingEmergency}
+                  style={{
+                    backgroundColor: '#10b981',
+                    color: '#ffffff',
+                    border: 'none',
+                    padding: '8px 16px',
+                    borderRadius: '6px',
+                    fontWeight: '700',
+                    fontSize: '12px',
+                    cursor: resolvingEmergency ? 'not-allowed' : 'pointer',
+                    boxShadow: '0 0 10px rgba(16, 185, 129, 0.4)',
+                    transition: 'background-color 0.2s',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                  }}
+                >
+                  <span>✓</span>
+                  {resolvingEmergency ? 'Resolving...' : 'Resolve Emergency'}
+                </button>
+              </div>
             </div>
-          </div>
-        ) : (
+          );
+        })() : (
           /* Normal trigger form */
           <form
             onSubmit={handleEmergencySubmit}

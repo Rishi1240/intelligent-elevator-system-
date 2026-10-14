@@ -109,4 +109,72 @@ export const elevatorApi = {
     if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to get emergency status`);
     return await res.json();
   },
+
+  // ── Simulation Clock & Predictive Time Control ─────────────────────────────
+
+  async setClock({ date, time, mode } = {}) {
+    const res = await fetch(`${API_BASE_URL}/clock/set`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date, time, mode }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to set simulation time`);
+    return await res.json();
+  },
+
+  async startClock() {
+    const res = await fetch(`${API_BASE_URL}/clock/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to start simulation clock`);
+    return await res.json();
+  },
+
+  async pauseClock() {
+    const res = await fetch(`${API_BASE_URL}/clock/pause`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to pause simulation clock`);
+    return await res.json();
+  },
+
+  async resumeClock() {
+    const res = await fetch(`${API_BASE_URL}/clock/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to resume simulation clock`);
+    return await res.json();
+  },
+
+  async setClockSpeed(speed) {
+    const res = await fetch(`${API_BASE_URL}/clock/speed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ speed: Number(speed) }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to set simulation speed`);
+    return await res.json();
+  },
+
+  async setClockMode(mode) {
+    const res = await fetch(`${API_BASE_URL}/clock/mode`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to set clock mode`);
+    return await res.json();
+  },
+
+  async getClockStatus() {
+    const res = await fetch(`${API_BASE_URL}/clock/status`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to get clock status`);
+    return await res.json();
+  },
 };

@@ -4,6 +4,13 @@ Simulates a configurable building (2–20 floors, 1–5 elevators) with passenge
 boarding/alighting, queue dynamics, wait time calculations, and multi-objective
 RL reward formulation.
 
+Simulation Timing (see sim_clock.py):
+  - 1 simulated second per floor-to-floor movement.
+  - No pause at intermediate floors (1s travel only).
+  - 3 simulated seconds request-collection window at pickup floors only.
+  - Drop-off floors: passengers exit immediately, no collection window.
+  - Combined pickup+drop-off floors: single 3-second window.
+
 Caps:
   - num_floors  : 2 ≤ n ≤ 20  (hard cap: 20)
   - num_elevators: 1 ≤ n ≤ 5   (hard cap:  5)
@@ -11,6 +18,8 @@ Caps:
 
 import time
 from typing import Any
+
+from backend.sim_clock import SimClock
 
 
 # ── absolute limits ──────────────────────────────────────────────────────────
@@ -24,6 +33,10 @@ DEFAULT_FLOORS     = 10
 DEFAULT_ELEVATORS  = 3
 DEFAULT_CAPACITY   = 8
 
+# ── dwell / collection window durations (simulated seconds) ──────────────────
+DWELL_WINDOW_SECS = 3.0     # collection window at pickup/drop-off floor
+TRAVEL_SECS       = 1.0     # travel time between adjacent floors
+
 
 class ElevatorEnvironment:
     def __init__(
@@ -31,11 +44,14 @@ class ElevatorEnvironment:
         num_floors:    int = DEFAULT_FLOORS,
         num_elevators: int = DEFAULT_ELEVATORS,
         capacity:      int = DEFAULT_CAPACITY,
+        clock:         SimClock | None = None,
+        dwell_window_secs: float = 0.0,
     ):
         # ── clamp to allowed ranges ──────────────────────────────────────────
         self.num_floors    = max(MIN_FLOORS,    min(MAX_FLOORS,    int(num_floors)))
         self.num_elevators = max(MIN_ELEVATORS, min(MAX_ELEVATORS, int(num_elevators)))
         self.capacity      = max(1, int(capacity))
+        self.dwell_window_secs = max(0.0, float(dwell_window_secs))
 
         # Action space: (elevator_id: 0..num_elevators-1, target_floor: 1..num_floors)
         self.action_space = [
@@ -44,6 +60,7 @@ class ElevatorEnvironment:
             for f in range(1, self.num_floors + 1)
         ]
 
+        self.clock = clock or SimClock()
         self.emergency_dispatcher: Any = None
         self.reset()
 
@@ -87,9 +104,25 @@ class ElevatorEnvironment:
 
         self.assigned_stops      = [[] for _ in range(self.num_elevators)]
         self.pending_requests    = []
+        self._next_request_id    = 1
         self.congestion_prediction = 0.20
         self.step_count  = 0
         self.last_action = None
+
+        # ── dwell state per elevator ─────────────────────────────────────────
+        # When an elevator arrives at a scheduled stop, it enters a dwell
+        # (collection window).  dwell_remaining[e] counts how many simulated
+        # seconds of dwell are left.  While > 0 the elevator stays put and new
+        # passengers may board.
+        self.dwell_remaining: list[float] = [0.0] * self.num_elevators
+
+        # ── completed passenger statistics ───────────────────────────────────
+        self.completed_passengers = 0
+        self.total_wait_time_completed = 0.0
+        self.empty_movement_floors = 0
+        self.passenger_movement_floors = 0
+
+        self.clock.reset()
         return self.get_state()
 
     def add_request(self, src_floor: int, dst_floor: int) -> bool:
@@ -99,8 +132,13 @@ class ElevatorEnvironment:
         if src == dst:
             return False
 
+        if not hasattr(self, "_next_request_id"):
+            self._next_request_id = 1
+        req_id = self._next_request_id
+        self._next_request_id += 1
+
         self.pending_requests.append({
-            "id":          len(self.pending_requests) + int(time.time() * 1000) % 100000,
+            "id":          req_id,
             "src":         src,
             "dst":         dst,
             "assigned_to": None,
@@ -113,35 +151,187 @@ class ElevatorEnvironment:
         """Returns all pending requests that are not yet assigned to any elevator."""
         return [r for r in self.pending_requests if r.get("assigned_to") is None]
 
+    def simulate_projected_occupancies(self, e: int, additional_reqs: list[dict] = None) -> dict:
+        """
+        Simulates elevator e traversing its proposed route with currently onboard
+        passengers, currently assigned requests, and any candidate additional_reqs.
+
+        At each stop:
+          1. Drops off exiting passengers.
+          2. Recalculates occupancy.
+          3. Boards waiting passengers that can fit (up to self.capacity).
+          4. Updates individual destinations and remaining stops.
+
+        Returns dict:
+          - "feasible": bool (whether all onboard and proposed passengers fit within capacity)
+          - "peak_occupancy": int (max occupancy across entire route)
+          - "occupancy_at_pickup": dict[int, int] (floor -> occupancy when departing that pickup)
+          - "accommodated_count": int (number of additional_reqs that can fit)
+          - "stops": list[int] (projected sequence of stops)
+        """
+        pos = self.elevator_positions[e]
+        current_onboard = list(self.elevator_passengers[e])
+        assigned = [r for r in self.pending_requests if r.get("assigned_to") == e]
+        cand_reqs = list(additional_reqs or [])
+        all_reqs = assigned + cand_reqs
+
+        if not current_onboard and not all_reqs:
+            return {
+                "feasible": True,
+                "peak_occupancy": 0,
+                "occupancy_at_pickup": {},
+                "accommodated_count": len(cand_reqs),
+                "stops": [],
+            }
+
+        # Heading determination
+        heading = 0
+        if self.assigned_stops[e]:
+            first_stop = self.assigned_stops[e][0]
+            heading = 1 if first_stop > pos else (-1 if first_stop < pos else 0)
+        elif self.committed_targets[e] is not None:
+            t = self.committed_targets[e]
+            heading = 1 if t > pos else (-1 if t < pos else 0)
+
+        if heading == 0:
+            if current_onboard:
+                heading = 1 if any(d > pos for d in current_onboard) else (-1 if any(d < pos for d in current_onboard) else 0)
+            elif all_reqs:
+                first_r = all_reqs[0]
+                heading = 1 if first_r["src"] > pos else (-1 if first_r["src"] < pos else (1 if first_r["dst"] > pos else -1))
+
+        # Active emergency stops for elevator e
+        emg_stops = set()
+        if hasattr(self, "emergency_dispatcher") and self.emergency_dispatcher:
+            for emg in self.emergency_dispatcher.get_all_active():
+                if emg["status"] in ("en_route", "dispatched", "assigned") and emg["elevator_id"] == e:
+                    emg_stops.add(emg["floor"])
+
+        if heading >= 0:
+            up_stops = set()
+            for d in current_onboard:
+                if d >= pos:
+                    up_stops.add(d)
+            for r in all_reqs:
+                if r["dst"] > r["src"] and r["src"] >= pos:
+                    up_stops.add(r["src"])
+                    up_stops.add(r["dst"])
+                elif r["src"] >= pos:
+                    up_stops.add(r["src"])
+            for s in emg_stops:
+                if s >= pos:
+                    up_stops.add(s)
+
+            leg1 = sorted(up_stops)
+
+            down_stops = set()
+            for d in current_onboard:
+                if d < pos:
+                    down_stops.add(d)
+            for r in all_reqs:
+                if r["dst"] < r["src"] or r["src"] < pos:
+                    down_stops.add(r["src"])
+                    down_stops.add(r["dst"])
+            for s in emg_stops:
+                if s < pos:
+                    down_stops.add(s)
+
+            leg2 = sorted(down_stops, reverse=True)
+            combined = leg1 + [s for s in leg2 if s not in leg1]
+        else:
+            down_stops = set()
+            for d in current_onboard:
+                if d <= pos:
+                    down_stops.add(d)
+            for r in all_reqs:
+                if r["dst"] < r["src"] and r["src"] <= pos:
+                    down_stops.add(r["src"])
+                    down_stops.add(r["dst"])
+                elif r["src"] <= pos:
+                    down_stops.add(r["src"])
+            for s in emg_stops:
+                if s <= pos:
+                    down_stops.add(s)
+
+            leg1 = sorted(down_stops, reverse=True)
+
+            up_stops = set()
+            for d in current_onboard:
+                if d > pos:
+                    up_stops.add(d)
+            for r in all_reqs:
+                if r["dst"] > r["src"] or r["src"] > pos:
+                    up_stops.add(r["src"])
+                    up_stops.add(r["dst"])
+            for s in emg_stops:
+                if s > pos:
+                    up_stops.add(s)
+
+            leg2 = sorted(up_stops)
+            combined = leg1 + [s for s in leg2 if s not in leg1]
+
+        stops = [s for idx, s in enumerate(combined) if not (idx == 0 and s == pos)]
+
+        # Simulate route traversal
+        onboard = list(current_onboard)
+        waiting = list(all_reqs)
+        peak_occ = len(onboard)
+        occupancy_at_pickup = {}
+        accommodated_cands = set()
+
+        # Step 0: at current floor
+        onboard = [d for d in onboard if d != pos]
+        for r in list(waiting):
+            if r["src"] == pos:
+                if len(onboard) < self.capacity:
+                    onboard.append(r["dst"])
+                    waiting.remove(r)
+                    if r in cand_reqs:
+                        accommodated_cands.add(id(r))
+        peak_occ = max(peak_occ, len(onboard))
+        occupancy_at_pickup[pos] = len(onboard)
+
+        # Steps along planned stops
+        for st in stops:
+            # 1. Process drop-offs
+            onboard = [d for d in onboard if d != st]
+            # 2. Process pickups
+            for r in list(waiting):
+                if r["src"] == st:
+                    if len(onboard) < self.capacity:
+                        onboard.append(r["dst"])
+                        waiting.remove(r)
+                        if r in cand_reqs:
+                            accommodated_cands.add(id(r))
+            peak_occ = max(peak_occ, len(onboard))
+            occupancy_at_pickup[st] = len(onboard)
+
+        accommodated_count = len(accommodated_cands)
+        feasible = (accommodated_count == len(cand_reqs)) and (peak_occ <= self.capacity)
+
+        return {
+            "feasible": feasible,
+            "peak_occupancy": peak_occ,
+            "occupancy_at_pickup": occupancy_at_pickup,
+            "accommodated_count": accommodated_count,
+            "stops": stops,
+        }
+
     def can_accommodate(self, e: int, req: dict) -> bool:
         """
         Verifies whether elevator e has sufficient capacity to serve req
         without exceeding capacity at any point along its journey.
         """
-        src = req["src"]
-        dst = req["dst"]
-        low, high = min(src, dst), max(src, dst)
+        sim = self.simulate_projected_occupancies(e, [req])
+        return sim["feasible"]
 
-        # Check passenger count at every floor segment in [low, high - 1]
-        for f in range(low, high):
-            occ = 0
-            for p_dst in self.elevator_passengers[e]:
-                if dst > src and p_dst > f:
-                    occ += 1
-                elif dst < src and p_dst <= f:
-                    occ += 1
-            for r in self.pending_requests:
-                if r.get("assigned_to") == e and r != req:
-                    r_src = r["src"]
-                    r_dst = r["dst"]
-                    if r_dst > r_src and r_src <= f < r_dst:
-                        occ += 1
-                    elif r_dst < r_src and r_dst <= f < r_src:
-                        occ += 1
-
-            if occ + 1 > self.capacity:
-                return False
-        return True
+    def max_accommodatable(self, e: int, reqs: list[dict]) -> int:
+        """
+        Returns how many requests from reqs elevator e can accommodate
+        without exceeding capacity along its projected journey.
+        """
+        sim = self.simulate_projected_occupancies(e, reqs)
+        return sim["accommodated_count"]
 
     def calculate_insertion_cost(self, e: int, req: dict) -> float:
         """
@@ -159,45 +349,66 @@ class ElevatorEnvironment:
 
         curr_occ = len(self.elevator_passengers[e])
         assigned_reqs = [r for r in self.pending_requests if r.get("assigned_to") == e]
+        stops = list(self.assigned_stops[e])
+        target = self.committed_targets[e]
 
         # 1. Idle elevator
-        if curr_occ == 0 and not assigned_reqs and not self.assigned_stops[e]:
+        if curr_occ == 0 and not assigned_reqs and not stops and target is None:
             dist_to_pickup = abs(pos - src)
             ride_dist = abs(dst - src)
-            # Startup penalty + physical travel distance + wait time
-            return float(dist_to_pickup * 1.5 + ride_dist * 1.0 + 15.0)
+            startup_penalty = 15.0
+            return float(dist_to_pickup * 1.5 + ride_dist * 1.0 + startup_penalty)
 
-        # 2. Active elevator: check directional compatibility
-        t_floor = self.committed_targets[e]
-        if t_floor is None and self.assigned_stops[e]:
-            t_floor = self.assigned_stops[e][0]
+        # 2. Moving / Active elevator
+        all_planned = [pos]
+        if target is not None:
+            all_planned.append(target)
+        all_planned.extend(stops)
+        for r in assigned_reqs:
+            all_planned.extend([r["src"], r["dst"]])
+        max_stop = max(all_planned)
+        min_stop = min(all_planned)
 
-        elev_up = t_floor is not None and t_floor > pos
-        elev_down = t_floor is not None and t_floor < pos
+        can_serve_in_flight = False
 
-        can_batch = (
-            (elev_up and req_up and pos <= src) or
-            (elev_down and (not req_up) and pos >= src)
-        )
-
-        if can_batch:
-            # Batching along existing direction
-            current_stops = list(self.assigned_stops[e])
-            if not current_stops:
-                current_stops = list(self.elevator_passengers[e]) or [t_floor or pos]
-
-            if elev_up:
-                furthest_stop = max(current_stops) if current_stops else t_floor or pos
-                incremental_dist = max(0, dst - furthest_stop)
+        if not req_up:
+            # DOWN request (e.g. F10 -> F1)
+            # If the elevator is already carrying passengers heading away, don't reverse it
+            if curr_occ > 0 and pos > src and target is not None and target > pos:
+                can_serve_in_flight = False
             else:
-                furthest_stop = min(current_stops) if current_stops else t_floor or pos
-                incremental_dist = max(0, furthest_stop - dst)
+                heading_up_to_pickup = (pos <= src and ((target is not None and target >= src) or max_stop >= src))
+                heading_down_from_pickup = (pos >= src and (target is None or target <= pos))
+                if heading_up_to_pickup or heading_down_from_pickup:
+                    can_serve_in_flight = True
+        else:
+            # UP request (e.g. F1 -> F9 or F4 -> F8)
+            if curr_occ > 0 and pos < src and target is not None and target < pos:
+                can_serve_in_flight = False
+            else:
+                heading_down_to_pickup = (pos >= src and ((target is not None and target <= src) or min_stop <= src))
+                heading_up_from_pickup = (pos <= src and (target is None or target >= pos))
+                if heading_down_to_pickup or heading_up_from_pickup:
+                    can_serve_in_flight = True
 
-            wait_time = abs(src - pos)
-            stop_delay = 2.0  # delay added to existing passengers for stops
-            return float(incremental_dist * 1.0 + wait_time * 1.0 + stop_delay * 1.5)
+        if can_serve_in_flight:
+            if not req_up:
+                extra_pickup = max(0, src - max_stop)
+                extra_dropoff = max(0, min_stop - dst)
+            else:
+                extra_pickup = max(0, min_stop - src)
+                extra_dropoff = max(0, dst - max_stop)
 
-        # 3. Moving elevator requiring direction reversal or pickup behind elevator
+            stop_delay = 0.0
+            if src not in stops and src != target:
+                stop_delay += 1.5
+            if dst not in stops and dst != target:
+                stop_delay += 1.5
+
+            wait_dist = abs(src - pos) * 0.5
+            return float((extra_pickup + extra_dropoff) * 1.0 + stop_delay + wait_dist + 2.0)
+
+        # 3. Elevator requires opposite-direction reversal with passengers onboard or is moving away
         return float(80.0 + abs(src - pos) * 2.0 + abs(dst - src))
 
     def compute_elevator_suitability(self, e: int, req: dict) -> float:
@@ -225,12 +436,16 @@ class ElevatorEnvironment:
         emg_stops = set()
         if hasattr(self, "emergency_dispatcher") and self.emergency_dispatcher:
             for emg in self.emergency_dispatcher.get_all_active():
-                if emg["status"] == "dispatched" and emg["elevator_id"] == e:
+                if emg["status"] in ("en_route", "dispatched", "assigned") and emg["elevator_id"] == e:
                     emg_stops.add(emg["floor"])
 
         if not onboard and not assigned_reqs and not emg_stops:
-            self.assigned_stops[e] = []
-            self.committed_targets[e] = None
+            if self.assigned_stops[e]:
+                self.assigned_stops[e] = [s for s in self.assigned_stops[e] if s != pos]
+                self.committed_targets[e] = self.assigned_stops[e][0] if self.assigned_stops[e] else None
+            else:
+                self.assigned_stops[e] = []
+                self.committed_targets[e] = None
             return
 
         # Determine current heading
@@ -270,6 +485,8 @@ class ElevatorEnvironment:
                 if r["dst"] > r["src"] and r["src"] >= pos:
                     up_stops.add(r["src"])
                     up_stops.add(r["dst"])
+                elif r["src"] >= pos:
+                    up_stops.add(r["src"])
             for s in emg_stops:
                 if s >= pos:
                     up_stops.add(s)
@@ -300,6 +517,8 @@ class ElevatorEnvironment:
                 if r["dst"] < r["src"] and r["src"] <= pos:
                     down_stops.add(r["src"])
                     down_stops.add(r["dst"])
+                elif r["src"] <= pos:
+                    down_stops.add(r["src"])
             for s in emg_stops:
                 if s <= pos:
                     down_stops.add(s)
@@ -321,7 +540,7 @@ class ElevatorEnvironment:
             leg2 = sorted(up_stops)
             combined = leg1 + [s for s in leg2 if s not in leg1]
 
-        final_stops = [s for s in combined if s != pos]
+        final_stops = [s for idx, s in enumerate(combined) if not (idx == 0 and s == pos)]
         self.assigned_stops[e] = final_stops
         self.committed_targets[e] = final_stops[0] if final_stops else None
 
@@ -405,6 +624,15 @@ class ElevatorEnvironment:
             "num_floors":           self.num_floors,
             "num_elevators":        self.num_elevators,
             "capacity":             self.capacity,
+            # ── simulation clock ─────────────────────────────────────────────
+            "sim_time":             round(self.clock.now(), 2),
+            # ── dwell windows ────────────────────────────────────────────────
+            "dwell_remaining":      [round(d, 1) for d in self.dwell_remaining],
+            # ── completed passenger stats ────────────────────────────────────
+            "completed_passengers": self.completed_passengers,
+            # ── energy & movement metrics ────────────────────────────────────
+            "empty_movement_floors":     self.empty_movement_floors,
+            "passenger_movement_floors": self.passenger_movement_floors,
         }
 
     def get_action_space(self) -> list:
@@ -459,14 +687,48 @@ class ElevatorEnvironment:
         self.pending_requests = remaining_pending
         return picked
 
+    def _is_scheduled_stop(self, e: int, floor: int) -> bool:
+        """Returns True if `floor` is a scheduled pickup, drop-off, or emergency stop for elevator e."""
+        # Drop-off?
+        if floor in self.elevator_passengers[e]:
+            return True
+        # Pickup?
+        for req in self.pending_requests:
+            if req.get("assigned_to") == e and req["src"] == floor:
+                return True
+        # Emergency stop?
+        if hasattr(self, "emergency_dispatcher") and self.emergency_dispatcher:
+            for emg in self.emergency_dispatcher.get_all_active():
+                if emg["elevator_id"] == e and emg["floor"] == floor:
+                    return True
+        # In assigned_stops list?
+        if floor in self.assigned_stops[e]:
+            return True
+        return False
+
+    def _needs_dwell_window(self, e: int, floor: int) -> bool:
+        """Returns True if floor is a scheduled stop (pickup, drop-off, or emergency) requiring dwell."""
+        return self._is_scheduled_stop(e, floor)
+
     def step(self, action=None) -> tuple:
         """
-        Executes one environment step.
-        Advances all elevators that have active trips (onboard passengers or assigned pickups).
-        Idle elevators (no onboard passengers, no assigned pickups) remain strictly stationary.
+        Executes one environment step (= 1 simulated second).
+
+        Behaviour per elevator each step:
+        1. If dwelling (collection window active), decrement dwell_remaining.
+           During dwell: process pickups and drop-offs; do NOT move.
+        2. If NOT dwelling:
+           a. If at a scheduled stop floor, start collection window.
+           b. Otherwise, move 1 floor toward committed_targets[e].
+           c. After moving, process drop-offs and pickups.
+           d. If the new floor was a scheduled stop, start a collection window.
+           e. Intermediate floors do NOT trigger dwell (1s transit).
+        3. Idle elevators (no passengers, no stops, no targets) stay stationary.
         """
         prev_state = self.get_state()
         self.step_count += 1
+        if self.clock.deterministic:
+            self.clock.advance(TRAVEL_SECS)
 
         dispatched_elevator_id = None
         if action is not None:
@@ -484,6 +746,38 @@ class ElevatorEnvironment:
         for e in range(self.num_elevators):
             curr_floor = self.elevator_positions[e]
 
+            # ── Dwelling (collection window) ─────────────────────────────────
+            if self.dwell_remaining[e] > 0:
+                self.dwell_remaining[e] -= TRAVEL_SECS
+                if self.dwell_remaining[e] < 0.01:
+                    self.dwell_remaining[e] = 0.0
+
+                # During dwell: process drop-offs and pickups at current floor
+                passengers_before = len(self.elevator_passengers[e])
+                self.elevator_passengers[e] = [
+                    dst for dst in self.elevator_passengers[e] if dst != curr_floor
+                ]
+                dropped = passengers_before - len(self.elevator_passengers[e])
+                total_dropped_off += dropped
+                if dropped > 0:
+                    self.completed_passengers += dropped
+
+                picked = self._pickup_at_floor(e, curr_floor)
+                total_picked_up += picked
+
+                # Remove curr_floor from assigned_stops if present
+                if curr_floor in self.assigned_stops[e]:
+                    self.assigned_stops[e] = [s for s in self.assigned_stops[e] if s != curr_floor]
+
+                # When dwell ends, recompute route for the remaining journey
+                if self.dwell_remaining[e] <= 0:
+                    self._recompute_route(e)
+                continue
+
+            # ── Not dwelling ─────────────────────────────────────────────────
+            # Check if current floor is a scheduled stop before moving
+            was_scheduled_here = self._is_scheduled_stop(e, curr_floor)
+
             # 1. Board any assigned passenger waiting at current floor before moving
             picked = self._pickup_at_floor(e, curr_floor)
             total_picked_up += picked
@@ -495,7 +789,6 @@ class ElevatorEnvironment:
                 # Idle elevator: remains strictly stationary! Movement = 0.
                 continue
 
-            # 2. Move 1 floor toward target
             step_movement = 0
             if curr_floor < t_floor:
                 self.elevator_positions[e] += 1
@@ -504,29 +797,52 @@ class ElevatorEnvironment:
                 self.elevator_positions[e] -= 1
                 step_movement = 1
             total_movement_dist += step_movement
+            if step_movement > 0:
+                if len(self.elevator_passengers[e]) == 0:
+                    self.empty_movement_floors += 1
+                else:
+                    self.passenger_movement_floors += 1
             curr_floor = self.elevator_positions[e]
 
-            # 3. Drop off passengers whose destination is curr_floor
+            # 4. Drop off passengers whose destination is curr_floor
             passengers_before = len(self.elevator_passengers[e])
             self.elevator_passengers[e] = [
                 dst for dst in self.elevator_passengers[e] if dst != curr_floor
             ]
             dropped = passengers_before - len(self.elevator_passengers[e])
             total_dropped_off += dropped
+            if dropped > 0:
+                self.completed_passengers += dropped
 
-            # 4. Pick up passengers waiting at arrival floor
-            total_picked_up += self._pickup_at_floor(e, curr_floor)
+            # 5. Pick up passengers waiting at arrival floor
+            picked = self._pickup_at_floor(e, curr_floor)
+            total_picked_up += picked
 
-            # 5. Remove curr_floor from assigned_stops if arrived
+            # 6. Check if this arrival was a scheduled stop
+            was_scheduled = (
+                dropped > 0
+                or picked > 0
+                or curr_floor in self.assigned_stops[e]
+                or (t_floor is not None and t_floor == curr_floor)
+                or self._is_scheduled_stop(e, curr_floor)
+            )
+
+            # Remove curr_floor from assigned_stops if arrived
             if curr_floor in self.assigned_stops[e]:
                 self.assigned_stops[e] = [s for s in self.assigned_stops[e] if s != curr_floor]
 
-            # 6. Recompute route to keep assigned_stops and committed_targets synchronized
+            # 7. Start collection window at scheduled stops (pickup, drop-off, emergency)
+            #    Intermediate floors do NOT trigger dwell.
+            #    Combined pickup+dropoff triggers single window.
+            if was_scheduled and self.dwell_window_secs > 0:
+                self.dwell_remaining[e] = self.dwell_window_secs
+
+            # 8. Recompute route to keep assigned_stops and committed_targets synchronized
             self._recompute_route(e)
 
         # 6. Age remaining pending requests
         for req in self.pending_requests:
-            req["wait_time"] += 1.0
+            req["wait_time"] += TRAVEL_SECS
 
         # 7. Calculate reward
         reward = self._calculate_reward(
